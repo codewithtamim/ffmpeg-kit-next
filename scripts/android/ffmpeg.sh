@@ -436,12 +436,20 @@ fi
 
 ###################################################################
 
+# opencore-amr, vo-amrwbenc and gmp need FFmpeg's version 3 licence terms. The
+# default build leaves them out and stays LGPL-2.1-or-later; set
+# FFMPEG_KIT_ENABLE_VERSION3=1 to build them with --enable-version3.
+VERSION3_OPTION=""
+if [[ "${FFMPEG_KIT_ENABLE_VERSION3:-0}" == "1" ]]; then
+  VERSION3_OPTION="--enable-version3"
+fi
+
 ./configure \
   --cross-prefix="${HOST}-" \
   --sysroot="${ANDROID_SYSROOT}" \
   --prefix="${FFMPEG_LIBRARY_PATH}" \
   --pkg-config="${HOST_PKG_CONFIG_PATH}" \
-  --enable-version3 \
+  ${VERSION3_OPTION} \
   --arch="${TARGET_ARCH}" \
   --cpu="${TARGET_CPU}" \
   --target-os=android \
