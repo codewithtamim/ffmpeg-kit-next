@@ -137,6 +137,7 @@ the same `FFmpeg` release branch.
 
 |    Platforms     |                                 FFmpegKit Version                                 | FFmpeg Version | Release Date |
 |:----------------:|:---------------------------------------------------------------------------------:|:--------------:|:------------:|
+|  Android<br>Flutter<br>iOS / iPadOS<br>Linux<br>macOS<br>React Native<br>tvOS<br>visionOS<br>Web<br>Windows      |   [9.0.2](https://github.com/arthenica/ffmpeg-kit-next/releases/tag/v9.0.2)    |      9.0.2       | Oct 24, 2026 |
 |  Android<br>Flutter<br>iOS / iPadOS<br>Linux<br>macOS<br>React Native<br>tvOS<br>visionOS<br>Web<br>Windows      |   [9.0.1](https://github.com/arthenica/ffmpeg-kit-next/releases/tag/v9.0.1)    |      9.0.2       | Oct 18, 2026 |
 |  Android<br>Flutter<br>iOS / iPadOS<br>Linux<br>macOS<br>React Native<br>tvOS<br>visionOS<br>Web<br>Windows      |   [9.0.0](https://github.com/arthenica/ffmpeg-kit-next/releases/tag/v9.0.0)    |      9.0.1       | Aug 24, 2026 |
 |  Windows      |   [8.1.1](https://github.com/arthenica/ffmpeg-kit-next/releases/tag/v8.1.1.windows)    |      8.1.2       | Aug 21, 2026 |
@@ -152,6 +153,9 @@ the same `FFmpeg` release branch.
 A more detailed documentation is available under [Wiki](https://github.com/arthenica/ffmpeg-kit-next/wiki).
 
 - [Video tutorials](https://github.com/arthenica/ffmpeg-kit-next/wiki/Video-Tutorials) are available for selected build workflows and project features.
+
+All development takes place on the [`development`](https://github.com/arthenica/ffmpeg-kit-next/tree/development)
+branch. Open all pull requests against `development`; see the [contributing guidelines](CONTRIBUTING.md).
 
 ### 14. Test Applications
 
