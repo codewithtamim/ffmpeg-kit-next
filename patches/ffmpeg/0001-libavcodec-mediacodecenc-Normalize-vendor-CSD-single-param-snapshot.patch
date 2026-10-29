@@ -25,7 +25,7 @@ Applied by scripts/android/ffmpeg.sh (CUSTOMIZATIONS). Re-entrant:
 already-applied patches are detected and skipped.
 
 diff --git a/libavcodec/mediacodecenc.c b/libavcodec/mediacodecenc.c
-index 507c48d..5034a40 100644
+index 507c48d..39fd446 100644
 --- a/libavcodec/mediacodecenc.c
 +++ b/libavcodec/mediacodecenc.c
 @@ -27,6 +27,7 @@
@@ -440,7 +440,7 @@ index 507c48d..5034a40 100644
          ff_AMediaCodec_releaseOutputBuffer(codec, index, false);
          // try immediately
          return mediacodec_receive(avctx, pkt);
-@@ -736,6 +1120,23 @@ static int mediacodec_receive(AVCodecContext *avctx, AVPacket *pkt)
+@@ -736,6 +1120,35 @@ static int mediacodec_receive(AVCodecContext *avctx, AVPacket *pkt)
          memcpy(pkt->data, s->extradata, extradata_size);
      }
      memcpy(pkt->data + extradata_size, out_buf + out_info.offset, out_info.size);
@@ -459,12 +459,24 @@ index 507c48d..5034a40 100644
 +
 +        if (kept != out_info.size)
 +            pkt->size = extradata_size + kept;
++
++        // Some vendors emit the parameter sets again as a bare buffer
++        // without the codec-config flag. With the global header already
++        // carrying them, stripping leaves nothing to encode, and an empty
++        // packet makes the encoder's bsf chain (crop metadata,
++        // extract_extradata) fail with "No NAL unit found in packet".
++        // Drop the buffer and take the next one.
++        if (!pkt->size) {
++            av_packet_unref(pkt);
++            ff_AMediaCodec_releaseOutputBuffer(codec, index, false);
++            return mediacodec_receive(avctx, pkt);
++        }
 +    }
 +
      pkt->pts = av_rescale_q(out_info.presentationTimeUs, AV_TIME_BASE_Q, avctx->time_base);
      if (s->pts_as_dts)
          pkt->dts = pkt->pts;
-@@ -967,14 +1368,30 @@ static int mediacodec_generate_extradata(AVCodecContext *avctx)
+@@ -967,14 +1380,30 @@ static int mediacodec_generate_extradata(AVCodecContext *avctx)
  
      side = av_packet_get_side_data(pkt, AV_PKT_DATA_NEW_EXTRADATA, &side_size);
      if (side && side_size > 0) {
@@ -501,7 +513,7 @@ index 507c48d..5034a40 100644
      }
  
  bailout:
-@@ -1004,6 +1421,9 @@ static av_cold int mediacodec_close(AVCodecContext *avctx)
+@@ -1004,6 +1433,9 @@ static av_cold int mediacodec_close(AVCodecContext *avctx)
      av_bsf_free(&s->bsf);
      av_frame_free(&s->frame);
  
