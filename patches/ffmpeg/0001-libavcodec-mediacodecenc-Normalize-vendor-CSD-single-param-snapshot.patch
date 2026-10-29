@@ -25,7 +25,7 @@ Applied by scripts/android/ffmpeg.sh (CUSTOMIZATIONS). Re-entrant:
 already-applied patches are detected and skipped.
 
 diff --git a/libavcodec/mediacodecenc.c b/libavcodec/mediacodecenc.c
-index 507c48d..39fd446 100644
+index 507c48d..4f750b4 100644
 --- a/libavcodec/mediacodecenc.c
 +++ b/libavcodec/mediacodecenc.c
 @@ -27,6 +27,7 @@
@@ -36,7 +36,7 @@ index 507c48d..39fd446 100644
  #include "libavutil/mem.h"
  #include "libavutil/opt.h"
  #include "libavutil/thread.h"
-@@ -664,6 +665,355 @@ static int mediacodec_get_output_index(AVCodecContext *avctx, ssize_t *index,
+@@ -664,6 +665,357 @@ static int mediacodec_get_output_index(AVCodecContext *avctx, ssize_t *index,
      return ret ? ret : AVERROR(EAGAIN);
  }
  
@@ -380,8 +380,10 @@ index 507c48d..39fd446 100644
 +
 +        if (!mce_is_parameter_nal(codec_id,
 +                                  mce_nal_type(codec_id, data + start,
-+                                               next - start)))
++                                               next - start))) {
 +            memmove(data + wr, data + rd, next - rd);
++            wr += next - rd;
++        }
 +
 +        rd = next;
 +    }
@@ -392,7 +394,7 @@ index 507c48d..39fd446 100644
  static int mediacodec_receive(AVCodecContext *avctx, AVPacket *pkt)
  {
      MediaCodecEncContext *s = avctx->priv_data;
-@@ -705,6 +1055,20 @@ static int mediacodec_receive(AVCodecContext *avctx, AVPacket *pkt)
+@@ -705,6 +1057,20 @@ static int mediacodec_receive(AVCodecContext *avctx, AVPacket *pkt)
      }
  
      if (out_info.flags & ff_AMediaCodec_getBufferFlagCodecConfig(codec)) {
@@ -413,7 +415,7 @@ index 507c48d..39fd446 100644
          if (avctx->codec_id == AV_CODEC_ID_AV1) {
              // Skip AV1CodecConfigurationRecord without configOBUs
              if (out_info.size <= 4) {
-@@ -721,6 +1085,26 @@ static int mediacodec_receive(AVCodecContext *avctx, AVPacket *pkt)
+@@ -721,6 +1087,26 @@ static int mediacodec_receive(AVCodecContext *avctx, AVPacket *pkt)
  
          s->extradata_size = out_info.size;
          memcpy(s->extradata, out_buf + out_info.offset, out_info.size);
@@ -440,7 +442,7 @@ index 507c48d..39fd446 100644
          ff_AMediaCodec_releaseOutputBuffer(codec, index, false);
          // try immediately
          return mediacodec_receive(avctx, pkt);
-@@ -736,6 +1120,35 @@ static int mediacodec_receive(AVCodecContext *avctx, AVPacket *pkt)
+@@ -736,6 +1122,35 @@ static int mediacodec_receive(AVCodecContext *avctx, AVPacket *pkt)
          memcpy(pkt->data, s->extradata, extradata_size);
      }
      memcpy(pkt->data + extradata_size, out_buf + out_info.offset, out_info.size);
@@ -476,7 +478,7 @@ index 507c48d..39fd446 100644
      pkt->pts = av_rescale_q(out_info.presentationTimeUs, AV_TIME_BASE_Q, avctx->time_base);
      if (s->pts_as_dts)
          pkt->dts = pkt->pts;
-@@ -967,14 +1380,30 @@ static int mediacodec_generate_extradata(AVCodecContext *avctx)
+@@ -967,14 +1382,30 @@ static int mediacodec_generate_extradata(AVCodecContext *avctx)
  
      side = av_packet_get_side_data(pkt, AV_PKT_DATA_NEW_EXTRADATA, &side_size);
      if (side && side_size > 0) {
@@ -513,7 +515,7 @@ index 507c48d..39fd446 100644
      }
  
  bailout:
-@@ -1004,6 +1433,9 @@ static av_cold int mediacodec_close(AVCodecContext *avctx)
+@@ -1004,6 +1435,9 @@ static av_cold int mediacodec_close(AVCodecContext *avctx)
      av_bsf_free(&s->bsf);
      av_frame_free(&s->frame);
  
