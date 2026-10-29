@@ -25,7 +25,7 @@ Applied by scripts/android/ffmpeg.sh (CUSTOMIZATIONS). Re-entrant:
 already-applied patches are detected and skipped.
 
 diff --git a/libavcodec/mediacodecenc.c b/libavcodec/mediacodecenc.c
-index 507c48d..4f750b4 100644
+index 507c48d..339e237 100644
 --- a/libavcodec/mediacodecenc.c
 +++ b/libavcodec/mediacodecenc.c
 @@ -27,6 +27,7 @@
@@ -36,7 +36,42 @@ index 507c48d..4f750b4 100644
  #include "libavutil/mem.h"
  #include "libavutil/opt.h"
  #include "libavutil/thread.h"
-@@ -664,6 +665,357 @@ static int mediacodec_get_output_index(AVCodecContext *avctx, ssize_t *index,
+@@ -83,6 +84,7 @@ typedef struct MediaCodecEncContext {
+     int level;
+     int pts_as_dts;
+     int extract_extradata;
++    int keep_parameter_nals;
+     // Ref. MediaFormat KEY_OPERATING_RATE
+     int operating_rate;
+     int async_mode;
+@@ -617,6 +619,26 @@ static av_cold int mediacodec_init(AVCodecContext *avctx)
+     }
+ 
+     ret = mediacodec_generate_extradata(avctx);
++    if (ret < 0)
++        goto bailout;
++
++    // Some containers (ASF/WMV) write the codec extradata into their header,
++    // but their platform extractor never hands it to MediaCodec as csd-0.
++    // The decoder then has no SPS/PPS to configure from and drops every
++    // frame. The dummy-frame handshake above consumed the CSD into
++    // avctx->extradata, so seed the packet stash with that normalized copy:
++    // the first real packet then starts with the parameter sets in band,
++    // where the extractor does pass them through.
++    if (s->keep_parameter_nals && avctx->extradata_size > 0 && !s->extradata_size) {
++        ret = av_reallocp(&s->extradata,
++                          avctx->extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
++        if (ret < 0)
++            goto bailout;
++        memcpy(s->extradata, avctx->extradata, avctx->extradata_size);
++        memset(s->extradata + avctx->extradata_size, 0,
++               AV_INPUT_BUFFER_PADDING_SIZE);
++        s->extradata_size = avctx->extradata_size;
++    }
+ 
+ bailout:
+     if (format)
+@@ -664,6 +686,357 @@ static int mediacodec_get_output_index(AVCodecContext *avctx, ssize_t *index,
      return ret ? ret : AVERROR(EAGAIN);
  }
  
@@ -394,7 +429,7 @@ index 507c48d..4f750b4 100644
  static int mediacodec_receive(AVCodecContext *avctx, AVPacket *pkt)
  {
      MediaCodecEncContext *s = avctx->priv_data;
-@@ -705,6 +1057,20 @@ static int mediacodec_receive(AVCodecContext *avctx, AVPacket *pkt)
+@@ -705,6 +1078,20 @@ static int mediacodec_receive(AVCodecContext *avctx, AVPacket *pkt)
      }
  
      if (out_info.flags & ff_AMediaCodec_getBufferFlagCodecConfig(codec)) {
@@ -415,7 +450,7 @@ index 507c48d..4f750b4 100644
          if (avctx->codec_id == AV_CODEC_ID_AV1) {
              // Skip AV1CodecConfigurationRecord without configOBUs
              if (out_info.size <= 4) {
-@@ -721,6 +1087,26 @@ static int mediacodec_receive(AVCodecContext *avctx, AVPacket *pkt)
+@@ -721,6 +1108,26 @@ static int mediacodec_receive(AVCodecContext *avctx, AVPacket *pkt)
  
          s->extradata_size = out_info.size;
          memcpy(s->extradata, out_buf + out_info.offset, out_info.size);
@@ -442,7 +477,7 @@ index 507c48d..4f750b4 100644
          ff_AMediaCodec_releaseOutputBuffer(codec, index, false);
          // try immediately
          return mediacodec_receive(avctx, pkt);
-@@ -736,6 +1122,35 @@ static int mediacodec_receive(AVCodecContext *avctx, AVPacket *pkt)
+@@ -736,6 +1143,35 @@ static int mediacodec_receive(AVCodecContext *avctx, AVPacket *pkt)
          memcpy(pkt->data, s->extradata, extradata_size);
      }
      memcpy(pkt->data + extradata_size, out_buf + out_info.offset, out_info.size);
@@ -478,7 +513,7 @@ index 507c48d..4f750b4 100644
      pkt->pts = av_rescale_q(out_info.presentationTimeUs, AV_TIME_BASE_Q, avctx->time_base);
      if (s->pts_as_dts)
          pkt->dts = pkt->pts;
-@@ -967,14 +1382,30 @@ static int mediacodec_generate_extradata(AVCodecContext *avctx)
+@@ -967,14 +1403,30 @@ static int mediacodec_generate_extradata(AVCodecContext *avctx)
  
      side = av_packet_get_side_data(pkt, AV_PKT_DATA_NEW_EXTRADATA, &side_size);
      if (side && side_size > 0) {
@@ -515,7 +550,7 @@ index 507c48d..4f750b4 100644
      }
  
  bailout:
-@@ -1004,6 +1435,9 @@ static av_cold int mediacodec_close(AVCodecContext *avctx)
+@@ -1004,6 +1456,9 @@ static av_cold int mediacodec_close(AVCodecContext *avctx)
      av_bsf_free(&s->bsf);
      av_frame_free(&s->frame);
  
@@ -525,3 +560,14 @@ index 507c48d..4f750b4 100644
      mediacodec_uninit_async_state(avctx);
  
      return 0;
+@@ -1059,6 +1514,10 @@ static const FFCodecDefault mediacodec_defaults[] = {
+     { "pts_as_dts", "Use PTS as DTS. It is enabled automatically if avctx max_b_frames <= 0, "              \
+                     "since most of Android devices don't output B frames by default.",                      \
+                     OFFSET(pts_as_dts), AV_OPT_TYPE_BOOL, {.i64 = -1}, -1, 1, VE },                         \
++    { "keep_parameter_nals", "Keep the parameter sets in the elementary stream even when a global "         \
++                    "header carries them. Needed for containers whose platform extractor does not "         \
++                    "expose the codec extradata (ASF/WMV).",                                                \
++                    OFFSET(keep_parameter_nals), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, VE },                  \
+     { "operating_rate", "The desired operating rate that the codec will need to operate at, zero for unspecified",    \
+                     OFFSET(operating_rate), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, VE },                  \
+     { "qp_i_min", "minimum quantization parameter for I frame",                                             \
