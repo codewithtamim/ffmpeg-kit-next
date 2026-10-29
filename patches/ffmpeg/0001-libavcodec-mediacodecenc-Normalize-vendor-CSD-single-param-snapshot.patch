@@ -1,0 +1,513 @@
+Fix hardware-encoder CSD handling for video compression (Samsung devices).
+
+MediaCodec encoders can hand the interaction of CSD and inline parameter
+sets through packets such that extract_extradata collects SPS/PPS twice;
+the container header written from that pool then carries duplicated
+parameter-set entries, and muxers like FLV rewrite a second, different
+header whenever later packets re-supply sets. Two conflicting header
+snapshots in one file: linear playback survives on the clean inline
+copies, but players that reconfigure the decoder from the container
+header on a seek or surface change initialize from the wrong snapshot —
+FLV black screens and MKV/MOV seek/resume freezes on real devices.
+
+This patch:
+ 1. normalizes every CSD where it enters the encoder wrapper into one
+    Annex B copy of each parameter set (dedupes repeated SPS/PPS, and
+    also accepts avcC/hvcC-shaped vendor CSDs),
+ 2. normalizes the dummy-frame NEW_EXTRADATA side data before it
+    becomes the global header,
+ 3. strips parameter-set NALs from output packets whenever a global
+    header already carries them (H264/HEVC), so extract_extradata never
+    re-fires and the header stays the single source of truth.
+
+Generated against src/ffmpeg @ 946fcce07b6dcd0331c8cc609192aeff5e1924f8.
+Applied by scripts/android/ffmpeg.sh (CUSTOMIZATIONS). Re-entrant:
+already-applied patches are detected and skipped.
+
+diff --git a/libavcodec/mediacodecenc.c b/libavcodec/mediacodecenc.c
+index 507c48d..5034a40 100644
+--- a/libavcodec/mediacodecenc.c
++++ b/libavcodec/mediacodecenc.c
+@@ -27,6 +27,7 @@
+ #include "libavutil/avstring.h"
+ #include "libavutil/hwcontext_mediacodec.h"
+ #include "libavutil/imgutils.h"
++#include "libavutil/intreadwrite.h"
+ #include "libavutil/mem.h"
+ #include "libavutil/opt.h"
+ #include "libavutil/thread.h"
+@@ -664,6 +665,355 @@ static int mediacodec_get_output_index(AVCodecContext *avctx, ssize_t *index,
+     return ret ? ret : AVERROR(EAGAIN);
+ }
+ 
++/*
++ * Normalizing vendor CSD. Hardware encoders hand out their parameter sets
++ * more than once: once in a CSD buffer, again inline with the next frame. A
++ * packet that carries both copies lets extract_extradata collect them all,
++ * and the container header built from that pool ends up with duplicated
++ * SPS/PPS entries (AVC records counting 2x SPS and 2x PPS were pulled from
++ * real device output; consumers reconfiguring from the header on a seek or
++ * surface change then initialize from the wrong snapshot while linear
++ * playback survives on the clean inline copies — the observed FLV black
++ * screens and MKV/MOV seek freezes). Some encoders also emit the CSD as an
++ * avcC/hvcC-shaped record instead of Annex B, which container writers would
++ * persist verbatim. Repair every CSD once, where it enters the wrapper: one
++ * Annex B copy of each parameter set, nothing else.
++ */
++
++#define MCE_MAX_PARAMETER_SETS 3
++
++/* SPS(7)/PPS(8) for H.264, VPS(32)/SPS(33)/PPS(34) for HEVC. */
++static int mce_is_parameter_nal(int codec_id, int type)
++{
++    if (codec_id == AV_CODEC_ID_H264)
++        return type == 7 || type == 8;
++    if (codec_id == AV_CODEC_ID_HEVC)
++        return type == 32 || type == 33 || type == 34;
++    return 0;
++}
++
++static int mce_nal_type(int codec_id, const uint8_t *buf, size_t size)
++{
++    if (size < 1)
++        return -1;
++    if (codec_id == AV_CODEC_ID_H264)
++        return buf[0] & 0x1f;
++    if (codec_id == AV_CODEC_ID_HEVC)
++        return (buf[0] >> 1) & 0x3f;
++    return -1;
++}
++
++/*
++ * Collect a parameter-set NAL unless the type was collected already; only
++ * the first copy of every type is kept.
++ */
++static void mce_collect_nal(int codec_id, int type, const uint8_t *buf,
++                            size_t size, const uint8_t *nal_data[],
++                            size_t nal_size[], int seen[])
++{
++    int slot;
++
++    if (size == 0 || !mce_is_parameter_nal(codec_id, type))
++        return;
++
++    slot = codec_id == AV_CODEC_ID_H264 ? type - 7 : type - 32;
++    if (slot < 0 || slot >= MCE_MAX_PARAMETER_SETS || seen[slot])
++        return;
++
++    seen[slot]     = 1;
++    nal_data[slot] = buf;
++    nal_size[slot] = size;
++}
++
++/* Collect the parameter sets carried by an Annex B (start code framed) CSD. */
++static void mce_collect_annexb(int codec_id, const uint8_t *buf, size_t size,
++                               const uint8_t *nal_data[],
++                               size_t nal_size[], int seen[])
++{
++    size_t i = 0;
++
++    while (i + 3 <= size) {
++        size_t sc, start, end;
++        int type;
++
++        if (buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1)
++            sc = 3;
++        else if (i + 4 <= size && buf[i] == 0 && buf[i + 1] == 0 &&
++                 buf[i + 2] == 0 && buf[i + 3] == 1)
++            sc = 4;
++        else {
++            i++;
++            continue;
++        }
++
++        start = i + sc;
++        end   = start + 1;
++        while (end + 3 <= size &&
++               !(buf[end] == 0 && buf[end + 1] == 0 && buf[end + 2] == 1) &&
++               !(end + 4 <= size && buf[end] == 0 && buf[end + 1] == 0 &&
++                 buf[end + 2] == 0 && buf[end + 3] == 1))
++            end++;
++        if (end + 3 > size)
++            end = size;
++
++        if (end > start) {
++            type = mce_nal_type(codec_id, buf + start, end - start);
++            mce_collect_nal(codec_id, type, buf + start, end - start,
++                            nal_data, nal_size, seen);
++        }
++
++        i = end;
++    }
++}
++
++/*
++ * Collect parameter sets from an avcC/hvcC shaped record. The declared NAL
++ * length size and the one the vendor used may disagree, so every plausible
++ * length size is attempted and the first one that yields a fully valid
++ * parameter-set walk wins. Bytes trailing the last enumerated array (vendor
++ * padding) are ignored.
++ */
++static void mce_collect_record(int codec_id, const uint8_t *buf, size_t size,
++                               const uint8_t *nal_data[],
++                               size_t nal_size[], int seen[])
++{
++    const uint8_t *tmp_data[MCE_MAX_PARAMETER_SETS];
++    size_t tmp_size[MCE_MAX_PARAMETER_SETS];
++    int tmp_seen[MCE_MAX_PARAMETER_SETS];
++    size_t declared, cand[3];
++    int ncand = 0, c;
++
++    if (codec_id == AV_CODEC_ID_H264 && size >= 7)
++        declared = (buf[4] & 0x03) + 1;
++    else if (codec_id == AV_CODEC_ID_HEVC && size >= 23)
++        declared = (buf[21] & 0x03) + 1;
++    else
++        return;
++
++    cand[ncand++] = declared;
++    if (declared != 4)
++        cand[ncand++] = 4;
++    if (declared != 2)
++        cand[ncand++] = 2;
++
++    for (c = 0; c < ncand; c++) {
++        size_t ls = cand[c], p;
++        int ok = 1, i;
++
++        memset(tmp_data, 0, sizeof(tmp_data));
++        memset(tmp_size, 0, sizeof(tmp_size));
++        memset(tmp_seen, 0, sizeof(tmp_seen));
++
++        if (codec_id == AV_CODEC_ID_H264) {
++            int n = buf[5] & 0x1f;
++
++            p = 6;
++            for (i = 0; i < n; i++) {
++                uint64_t len = 0;
++                int b, type;
++
++                if (p + ls > size) { ok = 0; break; }
++                for (b = 0; b < (int)ls; b++)
++                    len = (len << 8) | buf[p + b];
++                p += ls;
++                if (len == 0 || len > size - p) { ok = 0; break; }
++                type = mce_nal_type(AV_CODEC_ID_H264, buf + p, len);
++                if (type != 7) { ok = 0; break; }
++                mce_collect_nal(AV_CODEC_ID_H264, type, buf + p, len,
++                                tmp_data, tmp_size, tmp_seen);
++                p += len;
++            }
++
++            if (ok && p + 1 <= size) {
++                int m = buf[p++] & 0x1f;
++
++                for (i = 0; i < m && ok; i++) {
++                    uint64_t len = 0;
++                    int b, type;
++
++                    if (p + ls > size) { ok = 0; break; }
++                    for (b = 0; b < (int)ls; b++)
++                        len = (len << 8) | buf[p + b];
++                    p += ls;
++                    if (len == 0 || len > size - p) { ok = 0; break; }
++                    type = mce_nal_type(AV_CODEC_ID_H264, buf + p, len);
++                    if (type != 8) { ok = 0; break; }
++                    mce_collect_nal(AV_CODEC_ID_H264, type, buf + p, len,
++                                    tmp_data, tmp_size, tmp_seen);
++                    p += len;
++                }
++            } else
++                ok = 0;
++
++            if (ok && tmp_seen[0] && tmp_seen[1]) {
++                int k;
++
++                for (k = 0; k < MCE_MAX_PARAMETER_SETS; k++)
++                    if (tmp_seen[k]) {
++                        nal_data[k] = tmp_data[k];
++                        nal_size[k] = tmp_size[k];
++                        seen[k]     = 1;
++                    }
++                return;
++            }
++        } else {
++            int narrays = buf[22], a;
++
++            p = 23;
++            for (a = 0; a < narrays && ok; a++) {
++                int kind, m;
++
++                if (p + 2 > size) { ok = 0; break; }
++                kind = (buf[p] >> 1) & 0x3f;
++                m    = buf[p + 1];
++                p   += 2;
++                for (i = 0; i < m && ok; i++) {
++                    uint64_t len = 0;
++                    int b, type;
++
++                    if (p + ls > size) { ok = 0; break; }
++                    for (b = 0; b < (int)ls; b++)
++                        len = (len << 8) | buf[p + b];
++                    p += ls;
++                    if (len == 0 || len > size - p) { ok = 0; break; }
++                    type = mce_nal_type(AV_CODEC_ID_HEVC, buf + p, len);
++                    if (type != kind) { ok = 0; break; }
++                    mce_collect_nal(AV_CODEC_ID_HEVC, type, buf + p, len,
++                                    tmp_data, tmp_size, tmp_seen);
++                    p += len;
++                }
++            }
++
++            if (ok && tmp_seen[1] && tmp_seen[2]) {
++                int k;
++
++                for (k = 0; k < MCE_MAX_PARAMETER_SETS; k++)
++                    if (tmp_seen[k]) {
++                        nal_data[k] = tmp_data[k];
++                        nal_size[k] = tmp_size[k];
++                        seen[k]     = 1;
++                    }
++                return;
++            }
++        }
++    }
++}
++
++/*
++ * Turn a CSD into a plain, deduplicated Annex B parameter-set block:
++ * { 00 00 00 01 } SPS ... { 00 00 00 01 } PPS (a VPS first for HEVC).
++ * Returns a malloc()'d, zero padded buffer in *out / *out_size. Returns
++ * < 0 when the buffer carries nothing that can be normalized; the caller
++ * then keeps the original bytes and no buffer is allocated.
++ */
++static int mediacodec_normalize_csd(void *logctx, int codec_id, const uint8_t *buf,
++                             size_t size, uint8_t **out, size_t *out_size)
++{
++    const uint8_t *nal_data[MCE_MAX_PARAMETER_SETS];
++    size_t nal_size[MCE_MAX_PARAMETER_SETS];
++    int seen[MCE_MAX_PARAMETER_SETS] = { 0 };
++    size_t total = 0, offset = 0;
++    uint8_t *dst;
++    int i;
++
++    *out      = NULL;
++    *out_size = 0;
++
++    if (!buf || size < 4)
++        return AVERROR(EINVAL);
++
++    memset(nal_data, 0, sizeof(nal_data));
++    memset(nal_size, 0, sizeof(nal_size));
++
++    if (buf[0] == 0x01)
++        mce_collect_record(codec_id, buf, size, nal_data, nal_size, seen);
++    if (!seen[0] && !seen[1] && !seen[2]) {
++        memset(seen, 0, sizeof(seen));
++        mce_collect_annexb(codec_id, buf, size, nal_data, nal_size, seen);
++    }
++
++    if (codec_id == AV_CODEC_ID_H264 ? !seen[0] || !seen[1]
++                                     : !seen[1] || !seen[2])
++        return AVERROR(EINVAL);
++
++    for (i = 0; i < MCE_MAX_PARAMETER_SETS; i++)
++        if (seen[i])
++            total += 4 + nal_size[i];
++
++    dst = av_mallocz(total + AV_INPUT_BUFFER_PADDING_SIZE);
++    if (!dst)
++        return AVERROR(ENOMEM);
++
++    for (i = 0; i < MCE_MAX_PARAMETER_SETS; i++) {
++        if (!seen[i])
++            continue;
++        AV_WB32(dst + offset, 1);
++        memcpy(dst + offset + 4, nal_data[i], nal_size[i]);
++        offset += 4 + nal_size[i];
++    }
++
++    if (total != size)
++        av_log(logctx, AV_LOG_INFO,
++               "CSD normalized: %d bytes in, %d bytes out\n",
++               (int)size, (int)total);
++    else
++        av_log(logctx, AV_LOG_VERBOSE, "CSD already normalized\n");
++
++    *out      = dst;
++    *out_size = total;
++    return 0;
++}
++
++/*
++ * Drop parameter-set NALs from an Annex B access unit in place, keeping
++ * every other NAL and its start code verbatim. Used when the container
++ * header already carries the parameter sets: otherwise extract_extradata
++ * re-emits new-extradata side data and muxers like FLV rewrite a second
++ * header block — a second CSD snapshot in one file again. Returns the new
++ * size.
++ */
++static size_t mce_strip_parameter_nals(int codec_id, uint8_t *data,
++                                       size_t size)
++{
++    size_t rd = 0, wr = 0;
++
++    while (rd < size) {
++        size_t sc = 0, start, next;
++
++        if (rd + 3 <= size && data[rd] == 0 && data[rd + 1] == 0 &&
++            data[rd + 2] == 1)
++            sc = 3;
++        else if (rd + 4 <= size && data[rd] == 0 && data[rd + 1] == 0 &&
++                 data[rd + 2] == 0 && data[rd + 3] == 1)
++            sc = 4;
++
++        if (!sc) {
++            data[wr++] = data[rd++];
++            continue;
++        }
++
++        start = rd + sc;
++        next  = start;
++        while (next + 3 <= size &&
++               !(data[next] == 0 && data[next + 1] == 0 &&
++                 data[next + 2] == 1) &&
++               !(next + 4 <= size && data[next] == 0 && data[next + 1] == 0 &&
++                 data[next + 2] == 0 && data[next + 3] == 1))
++            next++;
++        if (next + 3 > size)
++            next = size;
++
++        if (!mce_is_parameter_nal(codec_id,
++                                  mce_nal_type(codec_id, data + start,
++                                               next - start)))
++            memmove(data + wr, data + rd, next - rd);
++
++        rd = next;
++    }
++
++    return wr;
++}
++
+ static int mediacodec_receive(AVCodecContext *avctx, AVPacket *pkt)
+ {
+     MediaCodecEncContext *s = avctx->priv_data;
+@@ -705,6 +1055,20 @@ static int mediacodec_receive(AVCodecContext *avctx, AVPacket *pkt)
+     }
+ 
+     if (out_info.flags & ff_AMediaCodec_getBufferFlagCodecConfig(codec)) {
++        // Muxers that negotiated a global header already receive the parameter sets
++        // through avctx->extradata. Appending a second copy to the next packet also
++        // puts them in the elementary stream, and containers written from a global
++        // header then carry two leading parameter-set groups on top of the inline
++        // copy — two different CSD snapshots in one file. Samsung's FLV demuxer
++        // chokes on exactly that and hands the decoder truncated config, so the
++        // frames come out black. A muxer without a global header has no extradata
++        // to offer and keeps getting the inline copy as before.
++        if ((avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) && avctx->extradata) {
++            ff_AMediaCodec_releaseOutputBuffer(codec, index, false);
++            // try immediately
++            return mediacodec_receive(avctx, pkt);
++        }
++
+         if (avctx->codec_id == AV_CODEC_ID_AV1) {
+             // Skip AV1CodecConfigurationRecord without configOBUs
+             if (out_info.size <= 4) {
+@@ -721,6 +1085,26 @@ static int mediacodec_receive(AVCodecContext *avctx, AVPacket *pkt)
+ 
+         s->extradata_size = out_info.size;
+         memcpy(s->extradata, out_buf + out_info.offset, out_info.size);
++
++        // Vendors hand out the CSD in different shapes (Annex B with
++        // duplicated parameter sets, or an avcC/hvcC record). Normalize it
++        // here so duplicated or record-framed parameter sets never reach an
++        // extradata consumer. On failure the original bytes are kept.
++        if (avctx->codec_id == AV_CODEC_ID_H264 ||
++            avctx->codec_id == AV_CODEC_ID_HEVC) {
++            uint8_t *normalized = NULL;
++            size_t normalized_size = 0;
++
++            ret = mediacodec_normalize_csd(avctx, avctx->codec_id, s->extradata,
++                                           s->extradata_size, &normalized,
++                                           &normalized_size);
++            if (!ret) {
++                av_free(s->extradata);
++                s->extradata      = normalized;
++                s->extradata_size = normalized_size;
++            }
++        }
++
+         ff_AMediaCodec_releaseOutputBuffer(codec, index, false);
+         // try immediately
+         return mediacodec_receive(avctx, pkt);
+@@ -736,6 +1120,23 @@ static int mediacodec_receive(AVCodecContext *avctx, AVPacket *pkt)
+         memcpy(pkt->data, s->extradata, extradata_size);
+     }
+     memcpy(pkt->data + extradata_size, out_buf + out_info.offset, out_info.size);
++
++    // When a global header already carries the parameter sets, strip the
++    // encoder's inline copies from this packet. They would make
++    // extract_extradata re-emit new-extradata side data, which the FLV muxer
++    // turns into another header block — a second CSD snapshot in one file,
++    // and a second one every time the vendor re-emits its parameter sets.
++    if ((avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) && avctx->extradata &&
++        (avctx->codec_id == AV_CODEC_ID_H264 ||
++         avctx->codec_id == AV_CODEC_ID_HEVC)) {
++        size_t kept = mce_strip_parameter_nals(avctx->codec_id,
++                                               pkt->data + extradata_size,
++                                               out_info.size);
++
++        if (kept != out_info.size)
++            pkt->size = extradata_size + kept;
++    }
++
+     pkt->pts = av_rescale_q(out_info.presentationTimeUs, AV_TIME_BASE_Q, avctx->time_base);
+     if (s->pts_as_dts)
+         pkt->dts = pkt->pts;
+@@ -967,14 +1368,30 @@ static int mediacodec_generate_extradata(AVCodecContext *avctx)
+ 
+     side = av_packet_get_side_data(pkt, AV_PKT_DATA_NEW_EXTRADATA, &side_size);
+     if (side && side_size > 0) {
+-        avctx->extradata = av_mallocz(side_size + AV_INPUT_BUFFER_PADDING_SIZE);
+-        if (!avctx->extradata) {
+-            ret = AVERROR(ENOMEM);
+-            goto bailout;
++        uint8_t *normalized = NULL;
++        size_t normalized_size = 0;
++
++        // The dummy-frame packet carries the CSD stash and the encoder's
++        // inline parameter sets at once, so the extracted extradata can hold
++        // duplicated parameter sets — and duplicated arrays in the container
++        // header written from it. Normalize to a single copy of each set,
++        // keeping the original bytes when the blob is not recognizable.
++        ret = mediacodec_normalize_csd(avctx, avctx->codec_id, side, side_size,
++                                       &normalized, &normalized_size);
++        if (ret < 0) {
++            normalized = av_mallocz(side_size + AV_INPUT_BUFFER_PADDING_SIZE);
++            if (!normalized) {
++                ret = AVERROR(ENOMEM);
++                goto bailout;
++            }
++
++            memcpy(normalized, side, side_size);
++            normalized_size = side_size;
+         }
+ 
+-        memcpy(avctx->extradata, side, side_size);
+-        avctx->extradata_size = side_size;
++        avctx->extradata      = normalized;
++        avctx->extradata_size = normalized_size;
++        ret = 0;
+     }
+ 
+ bailout:
+@@ -1004,6 +1421,9 @@ static av_cold int mediacodec_close(AVCodecContext *avctx)
+     av_bsf_free(&s->bsf);
+     av_frame_free(&s->frame);
+ 
++    av_freep(&s->extradata);
++    s->extradata_size = 0;
++
+     mediacodec_uninit_async_state(avctx);
+ 
+     return 0;

@@ -434,6 +434,23 @@ else
   "${BASEDIR}/scripts/android/ffmpeg-kit-protocols-test.sh" "${BASEDIR}" "${BASEDIR}/src/${LIB_NAME}" 1>>"${BASEDIR}"/build.log 2>&1 || return 1
 fi
 
+# 3. Apply custom ffmpeg patches from patches/ffmpeg. Safe to run again:
+# already-applied patches are detected and skipped, so a source tree kept
+# between builds is not patched twice.
+if [[ -d ${BASEDIR}/patches/ffmpeg ]]; then
+  for patch_file in "${BASEDIR}/patches/ffmpeg/"*.patch; do
+    [[ -e "${patch_file}" ]] || continue
+    if git apply --check --reverse "${patch_file}" 1>>"${BASEDIR}"/build.log 2>&1; then
+      echo -e "INFO: ${patch_file##*/} already applied, skipping\n" 1>>"${BASEDIR}"/build.log 2>&1
+    elif git apply "${patch_file}" 1>>"${BASEDIR}"/build.log 2>&1; then
+      echo -e "INFO: Applied ${patch_file##*/}\n" 1>>"${BASEDIR}"/build.log 2>&1
+    else
+      echo -e "\nERROR: Failed to apply ${patch_file##*/}"
+      return 1
+    fi
+  done
+fi
+
 ###################################################################
 
 # opencore-amr, vo-amrwbenc and gmp need FFmpeg's version 3 licence terms. The
