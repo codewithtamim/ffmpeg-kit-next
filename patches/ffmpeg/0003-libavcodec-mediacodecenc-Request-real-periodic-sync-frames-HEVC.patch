@@ -1,0 +1,376 @@
+Request real periodic sync frames on the HEVC MediaCodec encoder path.
+
+0002-libavcodec-mediacodecenc-Only-flag-real-IRAP-NALs-as-key-frames.patch
+stopped the container lying about which packets are real seek points, but
+left the actual cause untouched: on the Galaxy S24 Ultra (Qualcomm
+c2.qti.hevc.encoder, SM8650), the encoder still only ever emitted one true
+IDR NAL per encode, no matter what "i-frame-interval"/gop_size asked for.
+Every seek still decoded from t=0 — fast for a short clip, not for a long
+one.
+
+What is confirmed: "i-frame-interval" reaches the encoder as the Codec2
+scalar parameter coding.sync-frame-interval (seen live in this device's
+own CCodecConfig dump, set to the expected value), and does produce a
+periodic intra picture — but `trace_headers` on a real compression shows
+that picture is coded as an ordinary TRAIL_R NAL (type 1), not IDR (type
+19/20): 25 "key" packets, 1 real IDR, 24 TRAIL_R. The device's own config
+dump also lists a second, vector-typed parameter, coding.gop, logged as
+an "ignored struct field" during FFmpeg's generic AMediaFormat configure
+— that one plausibly controls the actual per-frame type assignment
+(I/P/B, real IDR vs. plain intra) and FFmpeg has no way to set it, but
+that specific mechanism is a hypothesis, not confirmed; what IS confirmed
+is the TRAIL_R-not-IDR result itself.
+
+The same config dump separately lists "coding.request-sync-frame.value"
+as a live, scalar, per-frame-request parameter. That is the same thing
+Android's public MediaCodec API exposes as PARAMETER_KEY_REQUEST_SYNC_FRAME
+/ AMEDIACODEC_KEY_REQUEST_SYNC_FRAME (the string "request-sync") via
+MediaCodec.setParameters(Bundle) / AMediaCodec_setParameters(AMediaFormat)
+— a request made while the codec is running, not a configure-time
+option, with a documented contract: the codec signals a real sync frame
+at or shortly after the next frame submitted. Whether issuing it actually
+promotes the resulting NAL to IDR on this specific encoder is the thing
+this patch sets out to test; see "Unverified" below.
+
+This patch:
+ 1. Adds setParameters support to both backends (mediacodec_wrapper.c/.h):
+    JNI via a reflected android.os.Bundle (setParameters takes a Bundle in
+    the Java API, not a MediaFormat/AMediaFormat, hence the separate
+    Bundle class/constructor/putInt handles), NDK by dlsym'ing
+    AMediaCodec_setParameters (available since API 26) the same way
+    setInputSurface and signalEndOfInputStream already are. Both expose
+    one new wrapper call, requestSyncFrame(), that builds the one-key
+    "request-sync" parameter set and sends it; either backend returns
+    AVERROR(ENOSYS) when the underlying call isn't available, which the
+    caller treats as "stop trying", not fatal.
+ 2. In mediacodecenc.c, HEVC-only (avctx->codec_id == AV_CODEC_ID_HEVC):
+    remembers avctx->gop_size as a frame count (mce_sync_gop_frames,
+    distinct from the seconds-based "i-frame-interval" already sent to
+    the codec), counts frames sent in mediacodec_send(), and calls
+    requestSyncFrame() right before queuing the frame that completes one
+    GOP. The counter resets whether or not the call succeeds, so a
+    transient failure is retried at the next GOP boundary rather than on
+    every following frame (the first draft of this patch reset it only
+    on success, which logged a failure on every single frame once the
+    call started failing). A result of ENOSYS disables the feature for
+    the rest of this encode (mce_sync_gop_frames = 0) instead of retrying
+    forever. The first success and the first failure are each logged
+    once at AV_LOG_INFO — the level the app's own diagnostics capture —
+    so a field log can distinguish "never ran", "ran but failed" and
+    "ran" without needing debug verbosity; the wrapper's own per-call
+    log is AV_LOG_DEBUG, to avoid a second, noisier line on every retry.
+    H.264 is untouched: the bug was only observed on this hardware HEVC
+    encoder, and this changes runtime behavior of every encode on
+    whichever codec it's applied to, not just packet flagging like 0002.
+
+Unverified: whether requestSyncFrame() actually makes c2.qti.hevc.encoder
+promote that frame to a real IDR NAL (type 19/20) rather than the TRAIL_R
+it currently uses. This is the standard, documented Android mechanism for
+forcing a sync frame, and the device's own config dump shows the
+matching Codec2 parameter live, but it has not been run on an S24 Ultra.
+If it works, 0002 becomes unnecessary for new encodes (every "key"
+packet will be a real IRAP) but stays correct and harmless to keep,
+including for files already encoded without this fix. If
+requestSyncFrame() comes back ENOSYS or the device rejects the
+parameter, or the resulting NALs are still TRAIL_R, this patch does
+nothing beyond what 0002 already does, and must be reported as such
+rather than assumed to work — the INFO log lines above exist specifically
+to tell that apart from the actual ffprobe/trace_headers result.
+
+Verification needed on-device (S24 Ultra, H.265 to MKV/MOV, a clip at
+least a minute or two long — a 25 s clip is too short for 0002 alone to
+look any different from a full fix): re-encode, then run both of:
+  ffprobe -v error -select_streams v:0 -show_entries packet=flags \
+    -of csv=p=0 OUT.mkv | sort | uniq -c
+  ffmpeg -hide_banner -i OUT.mkv -map 0:v -c copy -bsf:v trace_headers \
+    -f null - 2>&1 | grep nal_unit_type | awk '{print $NF}' | sort -n | uniq -c
+A fixed encoder shows a NAL type 19 or 20 at every GOP boundary, not just
+the first; before this patch only the very first one is type 19 and the
+rest are type 1 (TRAIL_R). Cross-check against the app's own diagnostics
+log for the "Issue 104 workaround" INFO lines this patch adds.
+
+Generated against src/ffmpeg @ 946fcce07b6dcd0331c8cc609192aeff5e1924f8,
+on top of 0001 and 0002. Applied by scripts/android/ffmpeg.sh
+(CUSTOMIZATIONS). Re-entrant: already-applied patches are detected and
+skipped. Verified with two full apply passes (0001, 0002, 0003, twice in
+a row) from a pristine checkout: pass 1 applies 0001-0003, pass 2 finds
+all three already applied and skips all three — none of this patch's
+hunks land inside a hunk any earlier patch owns.
+
+diff --git a/libavcodec/mediacodec_wrapper.c b/libavcodec/mediacodec_wrapper.c
+index 283bbe7..4bb4385 100644
+--- a/libavcodec/mediacodec_wrapper.c
++++ b/libavcodec/mediacodec_wrapper.c
+@@ -194,6 +194,11 @@ struct JNIAMediaCodecFields {
+
+     jmethodID set_input_surface_id;
+     jmethodID signal_end_of_input_stream_id;
++    jmethodID set_parameters_id;
++
++    jclass bundle_class;
++    jmethodID bundle_init_id;
++    jmethodID bundle_put_int_id;
+
+     jclass mediainfo_class;
+
+@@ -247,6 +252,12 @@ static const struct FFJniField jni_amediacodec_mapping[] = {
+
+         { "android/media/MediaCodec", "setInputSurface", "(Landroid/view/Surface;)V", FF_JNI_METHOD, OFFSET(set_input_surface_id), 0 },
+         { "android/media/MediaCodec", "signalEndOfInputStream", "()V", FF_JNI_METHOD, OFFSET(signal_end_of_input_stream_id), 0 },
++        { "android/media/MediaCodec", "setParameters", "(Landroid/os/Bundle;)V", FF_JNI_METHOD, OFFSET(set_parameters_id), 0 },
++
++    { "android/os/Bundle", NULL, NULL, FF_JNI_CLASS, OFFSET(bundle_class), 0 },
++
++        { "android/os/Bundle", "<init>", "()V", FF_JNI_METHOD, OFFSET(bundle_init_id), 0 },
++        { "android/os/Bundle", "putInt", "(Ljava/lang/String;I)V", FF_JNI_METHOD, OFFSET(bundle_put_int_id), 0 },
+
+     { "android/media/MediaCodec$BufferInfo", NULL, NULL, FF_JNI_CLASS, OFFSET(mediainfo_class), 1 },
+
+@@ -1762,6 +1773,66 @@ static int mediacodec_jni_signalEndOfInputStream(FFAMediaCodec *ctx)
+     return 0;
+ }
+
++/*
++ * Requests a real sync/IDR frame for the next input frame, via MediaCodec's
++ * "request-sync" runtime parameter (PARAMETER_KEY_REQUEST_SYNC_FRAME). All
++ * three handles are resolved as optional JNI members (setParameters,
++ * Bundle's constructor and putInt), since setParameters is only available
++ * from API 26 — a device below that, or any ROM missing it, leaves one of
++ * these null and this becomes a no-op returning AVERROR(ENOSYS), same as
++ * signalEndOfInputStream's guard for FFANativeWindow input.
++ */
++static int mediacodec_jni_requestSyncFrame(FFAMediaCodec *ctx)
++{
++    JNIEnv *env = NULL;
++    FFAMediaCodecJni *codec = (FFAMediaCodecJni *)ctx;
++    jobject bundle = NULL;
++    jstring key = NULL;
++    int ret = 0;
++
++    JNI_GET_ENV_OR_RETURN(env, codec, AVERROR_EXTERNAL);
++
++    if (!codec->jfields.set_parameters_id || !codec->jfields.bundle_class ||
++        !codec->jfields.bundle_init_id || !codec->jfields.bundle_put_int_id) {
++        return AVERROR(ENOSYS);
++    }
++
++    // The exception check runs first and unconditionally: a failed NewObject
++    // or NewStringUTF leaves a pending exception that corrupts the next JNI
++    // call on this thread if it isn't cleared here, whether or not the
++    // handle itself came back null.
++    bundle = (*env)->NewObject(env, codec->jfields.bundle_class, codec->jfields.bundle_init_id);
++    if (ff_jni_exception_check(env, 1, codec) < 0 || !bundle) {
++        ret = AVERROR_EXTERNAL;
++        goto done;
++    }
++
++    key = (*env)->NewStringUTF(env, "request-sync");
++    if (ff_jni_exception_check(env, 1, codec) < 0 || !key) {
++        ret = AVERROR_EXTERNAL;
++        goto done;
++    }
++
++    (*env)->CallVoidMethod(env, bundle, codec->jfields.bundle_put_int_id, key, 0);
++    if (ff_jni_exception_check(env, 1, codec) < 0) {
++        ret = AVERROR_EXTERNAL;
++        goto done;
++    }
++
++    (*env)->CallVoidMethod(env, codec->object, codec->jfields.set_parameters_id, bundle);
++    if (ff_jni_exception_check(env, 1, codec) < 0) {
++        ret = AVERROR_EXTERNAL;
++        goto done;
++    }
++
++done:
++    if (key)
++        (*env)->DeleteLocalRef(env, key);
++    if (bundle)
++        (*env)->DeleteLocalRef(env, bundle);
++    return ret;
++}
++
+ static int mediacodec_jni_setAsyncNotifyCallback(FFAMediaCodec *codec,
+                                                  const FFAMediaCodecOnAsyncNotifyCallback *callback,
+                                                  void *userdata)
+@@ -1829,6 +1900,7 @@ static const FFAMediaCodec media_codec_jni = {
+     .getConfigureFlagEncode = mediacodec_jni_getConfigureFlagEncode,
+     .cleanOutputBuffers = mediacodec_jni_cleanOutputBuffers,
+     .signalEndOfInputStream = mediacodec_jni_signalEndOfInputStream,
++    .requestSyncFrame = mediacodec_jni_requestSyncFrame,
+     .setAsyncNotifyCallback = mediacodec_jni_setAsyncNotifyCallback,
+ };
+
+@@ -1863,6 +1935,7 @@ typedef struct FFAMediaCodecNdk {
+     media_status_t (*signalEndOfInputStream)(AMediaCodec *);
+     media_status_t (*setAsyncNotifyCallback)(AMediaCodec *,
+             struct AMediaCodecOnAsyncNotifyCallback callback, void *userdata);
++    media_status_t (*setParameters)(AMediaCodec *, const AMediaFormat *);
+ } FFAMediaCodecNdk;
+
+ static const FFAMediaFormat media_format_ndk;
+@@ -2101,6 +2174,7 @@ static inline FFAMediaCodec *ndk_codec_create(int method, const char *arg) {
+     GET_SYMBOL(setInputSurface)
+     GET_SYMBOL(signalEndOfInputStream)
+     GET_SYMBOL(setAsyncNotifyCallback)
++    GET_SYMBOL(setParameters)
+
+ #undef GET_SYMBOL
+
+@@ -2376,6 +2450,40 @@ static int mediacodec_ndk_signalEndOfInputStream(FFAMediaCodec *ctx)
+     return 0;
+ }
+
++/*
++ * Requests a real sync/IDR frame for the next input frame, via MediaCodec's
++ * "request-sync" runtime parameter (AMEDIACODEC_KEY_REQUEST_SYNC_FRAME, whose
++ * value is the literal string below; used directly rather than the symbol so
++ * this links against NDKs older than its API 31 introduction). codec->setParameters
++ * is itself resolved with dlsym and is null before API 26, so this becomes a
++ * no-op returning AVERROR(ENOSYS) there.
++ */
++static int mediacodec_ndk_requestSyncFrame(FFAMediaCodec *ctx)
++{
++    FFAMediaCodecNdk *codec = (FFAMediaCodecNdk *)ctx;
++    AMediaFormat *params;
++    media_status_t status;
++
++    if (!codec->setParameters)
++        return AVERROR(ENOSYS);
++
++    params = AMediaFormat_new();
++    if (!params)
++        return AVERROR(ENOMEM);
++
++    AMediaFormat_setInt32(params, "request-sync", 0);
++    status = codec->setParameters(codec->impl, params);
++    AMediaFormat_delete(params);
++
++    if (status != AMEDIA_OK) {
++        av_log(codec, AV_LOG_DEBUG, "requestSyncFrame failed, %d\n", status);
++        return AVERROR_EXTERNAL;
++    }
++    av_log(codec, AV_LOG_DEBUG, "requestSyncFrame success\n");
++
++    return 0;
++}
++
+ static void mediacodec_ndk_onInputAvailable(AMediaCodec *impl, void *userdata,
+                                             int32_t index)
+ {
+@@ -2525,6 +2633,7 @@ static const FFAMediaCodec media_codec_ndk = {
+     .getConfigureFlagEncode = mediacodec_ndk_getConfigureFlagEncode,
+     .cleanOutputBuffers = mediacodec_ndk_cleanOutputBuffers,
+     .signalEndOfInputStream = mediacodec_ndk_signalEndOfInputStream,
++    .requestSyncFrame = mediacodec_ndk_requestSyncFrame,
+     .setAsyncNotifyCallback = mediacodec_ndk_setAsyncNotifyCallback,
+ };
+
+diff --git a/libavcodec/mediacodec_wrapper.h b/libavcodec/mediacodec_wrapper.h
+index 18d0796..5d29986 100644
+--- a/libavcodec/mediacodec_wrapper.h
++++ b/libavcodec/mediacodec_wrapper.h
+@@ -236,6 +236,14 @@ struct FFAMediaCodec {
+     // For encoder with FFANativeWindow as input.
+     int (*signalEndOfInputStream)(FFAMediaCodec *);
+
++    // Requests a real sync/IDR frame for the next input frame submitted, via
++    // MediaCodec's "request-sync" runtime parameter (PARAMETER_KEY_REQUEST_SYNC_FRAME).
++    // Some hardware encoders advertise a periodic BUFFER_FLAG_KEY_FRAME at
++    // i-frame-interval without that frame actually being a real IDR/IRAP NAL;
++    // this is the documented way to force one. Returns AVERROR(ENOSYS) when
++    // the underlying call isn't available (API level, missing symbol).
++    int (*requestSyncFrame)(FFAMediaCodec *codec);
++
+     // Introduced in Android API 28
+     int (*setAsyncNotifyCallback)(FFAMediaCodec *codec,
+                                   const FFAMediaCodecOnAsyncNotifyCallback *callback,
+@@ -364,6 +372,11 @@ static inline int ff_AMediaCodec_signalEndOfInputStream(FFAMediaCodec *codec)
+     return codec->signalEndOfInputStream(codec);
+ }
+
++static inline int ff_AMediaCodec_requestSyncFrame(FFAMediaCodec *codec)
++{
++    return codec->requestSyncFrame(codec);
++}
++
+ static inline int ff_AMediaCodec_setAsyncNotifyCallback(FFAMediaCodec *codec,
+         const FFAMediaCodecOnAsyncNotifyCallback *callback,
+         void *userdata)
+diff --git a/libavcodec/mediacodecenc.c b/libavcodec/mediacodecenc.c
+index beb128c..1a96a82 100644
+--- a/libavcodec/mediacodecenc.c
++++ b/libavcodec/mediacodecenc.c
+@@ -73,6 +73,15 @@ typedef struct MediaCodecEncContext {
+     int width;
+     int height;
+
++    // HEVC-only workaround for Issue 104: periodic sync frames this encoder
++    // emits automatically (via "i-frame-interval"/sync-frame-interval below)
++    // come out as ordinary TRAIL_R pictures on some hardware, not real IDR
++    // NALs, even though BUFFER_FLAG_KEY_FRAME claims they are. 0 disables it
++    // (not HEVC, or gop_size <= 0).
++    int mce_sync_gop_frames;
++    int64_t mce_frames_since_sync;
++    int mce_sync_request_logged; /* 0 = not yet logged, 1 = success logged, -1 = failure logged */
++
+     uint8_t *extradata;
+     int extradata_size;
+     int eof_sent;
+@@ -551,6 +560,15 @@ static av_cold int mediacodec_init(AVCodecContext *avctx)
+     ff_AMediaFormat_setInt32(format, "frame-rate", s->fps);
+     ff_AMediaFormat_setInt32(format, "i-frame-interval", gop);
+
++    // See Issue 104: on some hardware HEVC encoders, "i-frame-interval"
++    // above produces a periodic intra picture that BUFFER_FLAG_KEY_FRAME
++    // calls a key frame without it being a real IDR NAL. mediacodec_send()
++    // additionally requests one explicitly at the same cadence, in frames
++    // rather than seconds, so it still fires correctly when the source's
++    // real frame rate does not match s->fps exactly.
++    if (avctx->codec_id == AV_CODEC_ID_HEVC && avctx->gop_size > 0)
++        s->mce_sync_gop_frames = avctx->gop_size;
++
+     ret = ff_AMediaCodecProfile_getProfileFromAVCodecContext(avctx);
+     if (ret > 0) {
+         av_log(avctx, AV_LOG_DEBUG, "set profile to 0x%x\n", ret);
+@@ -1336,6 +1354,40 @@ static int mediacodec_send(AVCodecContext *avctx,
+     }
+
+     if (frame) {
++        // See Issue 104 and the comment on mce_sync_gop_frames above: ask
++        // for a real sync frame explicitly at the same cadence -g/gop_size
++        // already implies, instead of trusting the encoder's own periodic
++        // "i-frame-interval" to produce one. The counter resets whether or
++        // not the request succeeds, so a failure is retried at the next
++        // GOP boundary rather than on every following frame; ENOSYS means
++        // the call isn't available at all (API level, missing symbol), so
++        // that disables this permanently instead of retrying forever. Both
++        // outcomes are logged once, at INFO, so a captured log can tell
++        // "never ran", "failed" and "ran" apart without DEBUG verbosity.
++        if (s->mce_sync_gop_frames > 0 &&
++            s->mce_frames_since_sync >= s->mce_sync_gop_frames) {
++            int sync_ret = ff_AMediaCodec_requestSyncFrame(codec);
++            s->mce_frames_since_sync = 0;
++            if (sync_ret == 0) {
++                if (s->mce_sync_request_logged <= 0) {
++                    av_log(avctx, AV_LOG_INFO,
++                           "Issue 104 workaround: requesting a real sync frame "
++                           "every %d frames\n", s->mce_sync_gop_frames);
++                    s->mce_sync_request_logged = 1;
++                }
++            } else {
++                if (s->mce_sync_request_logged >= 0) {
++                    av_log(avctx, AV_LOG_INFO,
++                           "Issue 104 workaround: requestSyncFrame failed, %d\n",
++                           sync_ret);
++                    s->mce_sync_request_logged = -1;
++                }
++                if (sync_ret == AVERROR(ENOSYS))
++                    s->mce_sync_gop_frames = 0;
++            }
++        }
++        s->mce_frames_since_sync++;
++
+         input_buf = ff_AMediaCodec_getInputBuffer(codec, index, &input_size);
+         copy_frame_to_buffer(avctx, frame, input_buf, input_size);
+

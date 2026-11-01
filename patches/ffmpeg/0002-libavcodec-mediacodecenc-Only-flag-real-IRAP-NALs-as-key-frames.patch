@@ -1,0 +1,184 @@
+Only flag real IRAP NALs as key frames (Qualcomm HEVC encoder, Issue 104).
+
+Qualcomm's c2.qti.hevc.encoder (seen on the Galaxy S24 Ultra, SM8650) sets
+BUFFER_FLAG_KEY_FRAME on every periodic "sync frame" it emits, but for the
+lifetime of one encode only ever writes a single true IDR NAL: every later
+"sync frame" is coded as an ordinary TRAIL_R picture that happens to be
+intra. A 25 s H.265 compression confirmed this on-device: ffprobe's packet
+flags and the encoder's own BufferInfo both call out 25 "key" packets (one
+a second, matching -g/sync-frame-interval), but `trace_headers` on the same
+file shows exactly one NAL of type 19 (IDR_W_RADL) for the whole file; the
+other 24 are type 1 (TRAIL_R).
+
+The GOP structure the platform exposes to force real periodic IDRs
+(coding.gop) is a vector-typed C2 parameter; FFmpeg's generic AMediaFormat
+configuration cannot set it (logcat: "ignored struct field
+coding.gop.values"), so passing -g cannot make this encoder produce more
+than one IDR. That part is not fixed here — see "Known limitation" below.
+
+mediacodec_receive() trusted BufferInfo's key-frame flag unconditionally,
+so the container's seek table ends up with 24 "sync points" that are not
+random-access points. A player that seeks to one of them flushes its
+decoder and feeds it a picture with no reference context to decode from.
+That plausibly explains the reported MKV/MOV seek freeze, and — since a
+resumed player likely re-seeks to its last position the same way — the
+black screen after returning from Settings, but the second half is not
+independently confirmed.
+
+This patch adds mce_packet_has_irap_nal(), which walks the Annex B NALs of
+the finished packet and checks the real HEVC NAL type (BLA/IDR/CRA, types
+16-23), and only sets AV_PKT_FLAG_KEY when the codec's flag and the
+bitstream agree. It is HEVC-only: the bug was only ever observed on this
+hardware HEVC encoder, and gating the H.264 path on the same check as well
+would be an unverified, broader behavior change affecting every AVC
+encoder's output, including the common default path.
+
+This does not make the encoder produce more IDRs — it only stops the
+container lying about where the existing ones are, so a seek decodes from
+the one real IDR instead of handing the decoder a picture it cannot
+resync from. That is slower than a seek near the target, but it finishes
+instead of sticking.
+
+Known limitation: with only this patch, every long HEVC compression on
+this encoder still has exactly one real seek point, at t=0 — the same
+shape as the AV1/VP9 single-keyframe regression fixed for Issues 106-108
+(video.go:582-593), except there the fix was `-g`; here `-g` already
+reaches the encoder (confirmed: it sets "coding.sync-frame-interval" and
+produces a real periodic intra picture every second) and still does not
+produce more than one IDR, because turning those periodic intra pictures
+into IDRs needs the vector-typed coding.gop parameter FFmpeg cannot set.
+On a short clip (the 25 s test file) decoding from t=0 is fast enough not
+to be noticeable; on a long one it would not be. Making the encoder emit
+real periodic IDRs needs either a vendor-specific GOP parameter this
+patch does not attempt to guess, or a per-GOP request-sync-frame call
+(coding.request-sync-frame is visible in this device's own CCodecConfig
+dump), and either way needs verification on the S24 Ultra, which this
+patch has not had.
+
+The call site is patched in place inside mediacodec_receive(); the helper
+itself is defined afterward, right after mediacodec_receive() ends and
+before mediacodec_get_input_index() begins, with a forward declaration
+added next to mediacodec_generate_extradata()'s existing one near the top
+of the file. Both insertion points sit in gaps 0001 leaves untouched
+(0001-libavcodec-mediacodecenc-Normalize-vendor-CSD-single-param-snapshot.patch
+is one large contiguous insertion ending partway into mediacodec_receive's
+body, followed by three more hunks inside that same function): landing
+new code inside any of those hunks, even between two of 0001's own
+functions, breaks the exact contiguous-text match the re-entrant
+"already applied" reverse-check and a future reverse-apply rely on. This
+patch's own hunks each sit entirely in pristine code 0001 never touches,
+so applying it does not disturb 0001's re-entrancy, and reversing 0002
+alone (checked with `git apply --check --reverse`) cleanly undoes it
+without touching 0001.
+
+Generated against src/ffmpeg @ 946fcce07b6dcd0331c8cc609192aeff5e1924f8,
+on top of 0001-libavcodec-mediacodecenc-Normalize-vendor-CSD-single-param-snapshot.patch.
+Applied by scripts/android/ffmpeg.sh (CUSTOMIZATIONS). Re-entrant:
+already-applied patches are detected and skipped. Verified with two full
+apply passes (0001 then 0002, twice in a row) from a pristine checkout:
+pass 1 applies 0002, pass 2 finds both already applied and skips both.
+
+diff --git a/libavcodec/mediacodecenc.c b/libavcodec/mediacodecenc.c
+index 339e237..beb128c 100644
+--- a/libavcodec/mediacodecenc.c
++++ b/libavcodec/mediacodecenc.c
+@@ -360,6 +360,9 @@ static void mediacodec_uninit_async_state(AVCodecContext *avctx)
+
+ static int mediacodec_generate_extradata(AVCodecContext *avctx);
+
++/* Defined after mediacodec_receive(), which is its only caller. */
++static int mce_packet_has_irap_nal(int codec_id, const uint8_t *data, size_t size);
++
+ static void mediacodec_set_qp_range(AVCodecContext *avctx,
+                                     FFAMediaFormat *format)
+ {
+@@ -1175,7 +1178,8 @@ static int mediacodec_receive(AVCodecContext *avctx, AVPacket *pkt)
+     pkt->pts = av_rescale_q(out_info.presentationTimeUs, AV_TIME_BASE_Q, avctx->time_base);
+     if (s->pts_as_dts)
+         pkt->dts = pkt->pts;
+-    if (out_info.flags & ff_AMediaCodec_getBufferFlagKeyFrame(codec))
++    if ((out_info.flags & ff_AMediaCodec_getBufferFlagKeyFrame(codec)) &&
++        mce_packet_has_irap_nal(avctx->codec_id, pkt->data, pkt->size))
+         pkt->flags |= AV_PKT_FLAG_KEY;
+     ret = 0;
+
+@@ -1188,6 +1192,79 @@ bailout:
+     return ret;
+ }
+
++/*
++ * Whether this Annex B HEVC packet carries a real IRAP NAL (BLA/IDR/CRA,
++ * types 16-23) rather than just a BUFFER_FLAG_KEY_FRAME claim from the
++ * codec. Not applied to H.264: this was only ever observed on a hardware
++ * HEVC encoder, and gating every AVC encoder on this check as well would be
++ * an unverified, broader behavior change.
++ *
++ * Qualcomm's c2.qti.hevc.encoder (seen on the Galaxy S24 Ultra, SM8650) marks
++ * every periodic "sync frame" it emits as a key frame in BufferInfo.flags,
++ * but for the lifetime of one encode only ever writes a single true IDR NAL:
++ * every later "sync frame" is coded as an ordinary TRAIL_R picture that
++ * happens to be intra. The GOP structure the platform exposes to force real
++ * periodic IDRs (coding.gop) is a vector-typed C2 parameter that FFmpeg's
++ * generic AMediaFormat configuration cannot set (it is dropped during
++ * configure with "ignored struct field coding.gop.values"), so -g alone
++ * cannot produce them on this encoder.
++ *
++ * A player that seeks to one of those mislabeled packets flushes its decoder
++ * and feeds it a picture with no reference context to decode from, which
++ * plausibly explains the reported MKV/MOV seek freeze and, since the resumed
++ * player likely seeks back to its last position the same way, the black
++ * screen after returning from Settings too — but that second half is not
++ * independently confirmed. Flagging only packets that actually start with an
++ * IRAP NAL keeps the container's seek table honest: every seek decodes from
++ * the one real IDR instead of handing the decoder a picture it cannot resync
++ * from, so it finishes instead of sticking. It does not make the encoder
++ * produce more IDRs, so a long clip still has exactly one real seek point,
++ * at t=0, until that is fixed too (see the patch header).
++ */
++static int mce_packet_has_irap_nal(int codec_id, const uint8_t *data, size_t size)
++{
++    size_t rd = 0;
++
++    if (codec_id != AV_CODEC_ID_HEVC)
++        return 1;
++
++    while (rd < size) {
++        size_t sc = 0, start, next;
++        int type;
++
++        if (rd + 3 <= size && data[rd] == 0 && data[rd + 1] == 0 &&
++            data[rd + 2] == 1)
++            sc = 3;
++        else if (rd + 4 <= size && data[rd] == 0 && data[rd + 1] == 0 &&
++                 data[rd + 2] == 0 && data[rd + 3] == 1)
++            sc = 4;
++
++        if (!sc) {
++            rd++;
++            continue;
++        }
++
++        start = rd + sc;
++        next  = start;
++        while (next + 3 <= size &&
++               !(data[next] == 0 && data[next + 1] == 0 &&
++                 data[next + 2] == 1) &&
++               !(next + 4 <= size && data[next] == 0 && data[next + 1] == 0 &&
++                 data[next + 2] == 0 && data[next + 3] == 1))
++            next++;
++        if (next + 3 > size)
++            next = size;
++
++        type = mce_nal_type(codec_id, data + start, next - start);
++        if (type >= 16 && type <= 23)
++            return 1;
++
++        rd = next;
++    }
++
++    return 0;
++}
++
+ static int mediacodec_get_input_index(AVCodecContext *avctx, ssize_t *index)
+ {
+     MediaCodecEncContext *s = avctx->priv_data;
